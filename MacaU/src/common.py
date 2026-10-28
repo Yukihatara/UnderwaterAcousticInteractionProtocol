@@ -20,7 +20,7 @@ class Config:
 
     def tx_duration(self, bits: int) -> float:
         return bits / self.bitrate
-    
+
 
 @dataclass(frozen=True)
 class Frame:
