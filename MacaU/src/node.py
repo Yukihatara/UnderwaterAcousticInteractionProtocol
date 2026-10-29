@@ -7,10 +7,11 @@ from mac import MacLayer
 from physical import PhysicalLayer
 
 class Node:
-    def __init__(self, env: simpy.Environment, node_id: str, channel, config: Config):
+    def __init__(self, env: simpy.Environment, node_id: str, channel, topology, config: Config):
         self.env = env
         self.node_id = node_id
         self.config = config
+        self.topology = topology
 
         # Уровни (слои)
         self.channel = channel

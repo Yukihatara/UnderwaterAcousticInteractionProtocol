@@ -3,9 +3,9 @@ from enum import Enum, auto
 
 @dataclass(frozen=True)
 class Config:
-    distance: float = 1500.0
     sound_speed: float = 1500.0
     bitrate: float = 2400
+    max_range: float = 2000
 
     rts_bits: int = 256
     cts_bits: int = 256
@@ -14,13 +14,9 @@ class Config:
 
     backoff: float = 0.5
 
-    @property
-    def propagation_delay(self) -> float:
-        return self.distance / self.sound_speed
-
     def tx_duration(self, bits: int) -> float:
         return bits / self.bitrate
-
+    
 
 @dataclass(frozen=True)
 class Frame:

@@ -13,7 +13,6 @@ class MacLayer:
     WFCTS = 'WFCTS'
     WFDATA = 'WFDATA'
     WFACK = 'WFACK'
-    # WFACK_SEND = 'WFACK_SEND'      # шлём ACK, ещё не IDLE
 
     def __init__(self, node):
         self.node = node
@@ -51,20 +50,15 @@ class MacLayer:
         сработает, когда этот пакет будет доставлен (или провалится)."""
         done = self.env.event()
         self._queue.append((destination, sequence, payload, done))
-
         if not self._sender_running:
             self._sender_running = True
             self.env.process(self._sender_process())
-
         return done
 
     # ----------- Отправитель -----------------
 
     def _sender_process(self):
         while self._queue:
-            # Ждём: phy свободна И MAC в IDLE.
-            # phy.wait_free() — событие (без polling).
-            # state — polling 1e-3, пока не введём _idle_event в цикл.
             while True:
                 yield from self.node.phy.wait_free()
                 if self.state == self.IDLE:
@@ -83,8 +77,14 @@ class MacLayer:
         False при провале. Это генератор — вызывать через yield from."""
 
         self.retry = 0
+        
+        # propagation для пары (я, destination)
+        prop = self.node.topology.propagation_delay(
+            self.node.node_id, destination
+        )
+
         while True:
-            # === Шаг 1: RTS ===
+            # === RTS ===
             self.state = self.WFCTS
             self._cts_event = self.env.event()
             self.node.phy.reserve_tx()          # синхронно, ДО transmit
@@ -102,7 +102,7 @@ class MacLayer:
 
             # Ждем CTS или timeout.
             t_wait_cts = (
-                2 * self.config.propagation_delay
+                2 * prop
                 + self.config.tx_duration(self.config.cts_bits)
                 + self.config.tx_duration(self.config.rts_bits)
                 + EPS
@@ -138,7 +138,7 @@ class MacLayer:
 
             # Ждем ACK или timeout.
             t_wait_ack = (
-                2 * self.config.propagation_delay
+                2 * prop
                 + self.config.tx_duration(self.config.ack_bits)
                 + self.config.tx_duration(self.config.data_bits)
                 + EPS
@@ -201,12 +201,16 @@ class MacLayer:
 
         self.node.log(f"MAC: received RTS от {frame.source}, отправляю CTS")
         self.env.process(self.node.phy.transmit(cts))
-        self.env.process(self._wait_data_timeout())
+        self.env.process(self._wait_data_timeout(frame.source))
 
-    def _wait_data_timeout(self):
+    def _wait_data_timeout(self, source):
+        prop = self.node.topology.propagation_delay(
+            self.node.node_id, source
+        )
+
         t = (
             self.config.tx_duration(self.config.cts_bits)
-            + 2 * self.config.propagation_delay
+            + 2 * prop
             + self.config.tx_duration(self.config.data_bits)
             + EPS
         )
