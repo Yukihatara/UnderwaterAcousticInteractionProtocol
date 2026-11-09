@@ -74,7 +74,48 @@ def scenario_hidden_terminal():
         print(f"  seq={seq} from={s}: {p.decode(errors='replace')}")
     print()
 
+def scenario_force():
+    """Проверка NAV"""
+    print("=" * 60)
+    print("СЦЕНАРИЙ FORCE")
+    print("=" * 60)
+    env, channel, topology, a, b, c = build_environment()
+    # Искусственно поднимем NAV у C
+    c.mac.nav_until = 100.0
+
+    def sender():
+        ok = yield b.application.send("C", b"to C during NAV")
+        b.log(f"A доставлено={ok}")
+
+    env.process(sender())
+    env.run(until=20)
+
+def scenario_abort():
+    """Проверка abort"""
+    print("=" * 60)
+    print("СЦЕНАРИЙ Abort:\n" \
+    "A -> B\n" \
+    "C -> B, delay t")
+    print("=" * 60)
+    env, channel, topology, a, b, c = build_environment()
+    
+    def sender_a():
+        ok = yield a.application.send("B", b"from A")
+        a.log(f"A доставлено={ok}")
+
+    def sender_c():
+        yield env.timeout(0.5)
+        ok = yield c.application.send("B", b"from C")
+        c.log(f"A доставлено={ok}")
+
+    env.process(sender_a())
+    env.process(sender_c())
+    env.run(until=20)
+
 
 if __name__ == "__main__":
-    scenario_a_to_b_only()
+    # scenario_a_to_b_only()
     scenario_hidden_terminal()
+    # scenario_force()
+    # scenario_abort()
+

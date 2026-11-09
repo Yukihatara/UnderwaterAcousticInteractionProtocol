@@ -17,16 +17,22 @@ class MacLayer:
     def __init__(self, node):
         self.node = node
         self.state = self.IDLE
+        
         self.retry = 0
         self.max_retries = 3
+
         self._cts_event = None
         self._ack_event = None
 
         self._idle_event = self.env.event()
         self._idle_event.succeed()
 
+        self._abort_event = self.env.event()
+
         self._queue = []
         self._sender_running = False
+
+        self.nav_until = 0.0
 
     @property
     def env(self): return self.node.env
@@ -61,6 +67,8 @@ class MacLayer:
         while self._queue:
             while True:
                 yield from self.node.phy.wait_free()
+                while self.nav_until > self.env.now:
+                    yield self.env.timeout(self.nav_until - self.env.now)
                 if self.state == self.IDLE:
                     break
                 yield from self._wait_idle()
@@ -68,7 +76,12 @@ class MacLayer:
 
             destination, sequence, payload, done = self._queue.pop(0)
             success = yield from self._try_send(destination, sequence, payload)
-            done.succeed(value=success)
+            
+            # Возвращаем сообщение обратно в очередь
+            if success == None:
+                self._queue.insert(0, (destination, sequence, payload, done))
+            else: # Успех/провал
+                done.succeed(value=success)
 
         self._sender_running = False
 
@@ -77,16 +90,23 @@ class MacLayer:
         False при провале. Это генератор — вызывать через yield from."""
 
         self.retry = 0
-        
         # propagation для пары (я, destination)
-        prop = self.node.topology.propagation_delay(
-            self.node.node_id, destination
+        prop = self.node.topology.propagation_delay(self.node.node_id, destination)
+        nav_duration = ( # RTS -> CTS -> DATA -> ACK
+            self.config.tx_duration(self.config.cts_bits)
+            + self.config.tx_duration(self.config.data_bits)
+            + self.config.tx_duration(self.config.ack_bits)
+            + 3 * prop
+            + EPS
         )
-
         while True:
+            if self.nav_until > self.env.now:
+                self._set_idle()
+                return None
             # === RTS ===
             self.state = self.WFCTS
             self._cts_event = self.env.event()
+            self._abort_event = self.env.event()
             self.node.phy.reserve_tx()          # синхронно, ДО transmit
 
             rts = Frame(
@@ -95,6 +115,7 @@ class MacLayer:
                 destination=destination,
                 bits=self.config.rts_bits,
                 sequence=sequence,
+                duration=nav_duration,
             )
 
             self.node.log(f"MAC: state=WFCTS, отправляю RTS -> {destination}")
@@ -107,7 +128,14 @@ class MacLayer:
                 + self.config.tx_duration(self.config.rts_bits)
                 + EPS
             )
-            result = yield self._cts_event | self.env.timeout(t_wait_cts)
+            result = yield self._cts_event | self.env.timeout(t_wait_cts) | self._abort_event
+
+            if self._abort_event in result:
+                # Нас прервали — не шлём DATA.
+                self.node.log(f"MAC: обмен прерван по NAV (retry={self.retry})")
+                self._abort_event = self.env.event() # снова инициализируем событие
+                self._set_idle()
+                return None
 
             if self._cts_event not in result:
                 self.node.log(f"MAC: timeout CTS (retry={self.retry})")
@@ -169,11 +197,35 @@ class MacLayer:
 
     # ------------ Прием ------------------
 
-    def on_frame_received(self, frame: Frame):
+    def on_frame_received(self, frame: Frame): 
+        # (а) Чужой кадр — NAV, аборт, return.
         if frame.destination != self.node.node_id:
+            if frame.kind in (FrameType.RTS, FrameType.CTS) and frame.duration > 0:
+                new_nav = self.env.now + frame.duration
+                if new_nav > self.nav_until:
+                    old = self.nav_until
+                    self.nav_until = new_nav
+                    self.node.log(
+                        f"MAC: NAV обновлён: {old:.4f} -> {self.nav_until:.4f} "
+                        f"(по {frame.kind.name} от {frame.source})"
+                    )
             self.node.log(f"MAC: кадр {frame.kind.name} не мне ({frame.destination}), игнорирую")
             return
-
+        
+        # (б) Кадр мне, но NAV активен — игнорируем.
+        if self.env.now < self.nav_until:
+            if frame.kind is FrameType.ACK: # (Исключение на ACK - не игнорируем)
+                self._on_ack(frame)
+                return
+            if frame.kind is FrameType.CTS and frame.kind is FrameType.DATA:
+                self._ack_event.succeed() # обрываем кадр
+            self.node.log(
+                f"MAC: кадр {frame.kind.name} мне ({frame.source}), "
+                f"но NAV активен (до {self.nav_until:.4f}) — игнорирую"
+            )
+            return
+        
+        # (в) полноценная обработка.
         if frame.kind is FrameType.RTS:
             self._on_rts(frame)
         elif frame.kind is FrameType.CTS:
@@ -184,6 +236,13 @@ class MacLayer:
             self._on_ack(frame)
 
     def _on_rts(self, frame: Frame):
+        prop = self.node.topology.propagation_delay(self.node.node_id, frame.source)
+        nav_duration = (
+            self.config.tx_duration(self.config.data_bits)
+            + self.config.tx_duration(self.config.ack_bits)
+            + 3 * prop
+            + EPS
+        )
         if self.state != self.IDLE or self.node.phy.transmiting:
             self.node.log(f"MAC: RTS от {frame.source} проигнорирован, state={self.state}")
             return
@@ -197,6 +256,7 @@ class MacLayer:
             destination=frame.source,
             bits=self.config.cts_bits,
             sequence=frame.sequence,
+            duration=nav_duration
         )
 
         self.node.log(f"MAC: received RTS от {frame.source}, отправляю CTS")
@@ -204,10 +264,7 @@ class MacLayer:
         self.env.process(self._wait_data_timeout(frame.source))
 
     def _wait_data_timeout(self, source):
-        prop = self.node.topology.propagation_delay(
-            self.node.node_id, source
-        )
-
+        prop = self.node.topology.propagation_delay(self.node.node_id, source)
         t = (
             self.config.tx_duration(self.config.cts_bits)
             + 2 * prop

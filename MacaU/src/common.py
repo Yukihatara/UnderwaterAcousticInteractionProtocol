@@ -26,6 +26,7 @@ class Frame:
     bits: int
     sequence: int | None = None
     payload: bytes = b''
+    duration: float = 0.0
 
 
 class FrameType(Enum):
